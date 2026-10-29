@@ -1856,6 +1856,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_get_props(dev, &props);
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+        // LLAMA_NO_DEVICE_MMAP: map only CPU buffers onto the file; a GPU (Metal) buffer gets its own
+        // memory and a copy of its tensors, so experts kept on the CPU stay pageable and the GPU wires
+        // only its own tensors instead of the whole span of the file they are interleaved in.
+        if (getenv("LLAMA_NO_DEVICE_MMAP") && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            buffer_from_host_ptr_supported = false;
+        }
 
         std::vector<ggml_backend_buffer_ptr> bufs;
 
