@@ -1934,6 +1934,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!ml.no_alloc) {
                 pimpl->moe_stream->open_files(ml.file_paths);
             }
+            // cross-layer prefetch (LLAMA_MOE_STREAM_NO_PREFETCH=1 turns it off): each streamed
+            // layer scores its MoE input with the next streamed layer's router during decode
+            if (!getenv("LLAMA_MOE_STREAM_NO_PREFETCH")) {
+                auto & sls = pimpl->moe_stream->layers;
+                llama_moe_stream_layer * prev = nullptr;
+                for (size_t il = 0; il < sls.size() && il < layers.size(); il++) {
+                    llama_moe_stream_layer * sl = sls[il].get();
+                    if (!sl || !layers[il].ffn_gate_inp) {
+                        continue;
+                    }
+                    if (prev) {
+                        prev->next          = sl;
+                        prev->next_gate_inp = layers[il].ffn_gate_inp;
+                        prev->next_probs_b  = layers[il].ffn_exp_probs_b;
+                    }
+                    prev = sl;
+                }
+            }
         }
     }
 

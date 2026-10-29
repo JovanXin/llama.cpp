@@ -2025,6 +2025,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+    ggml_tensor * router_in = cur; // the MoE input, also scored by the next streamed layer's router
 
     ggml_tensor * logits = nullptr;
 
@@ -2196,7 +2197,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_gemm = selected_experts;
     if (msl && n_stream_waves == 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
-        ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+        // decode-sized ubatches also predict the next streamed layer's experts (same router input,
+        // its router) so their loads overlap the layers in between
+        if (msl->next && msl->next_gate_inp && n_tokens <= 8 &&
+                msl->next_gate_inp->ne[0] == router_in->ne[0] &&
+                (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID || gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX)) {
+            ggml_tensor * pl = ggml_mul_mat(ctx0, msl->next_gate_inp, router_in); // [n_expert, n_tokens]
+            pl = ggml_sigmoid(ctx0, pl);
+            if (msl->next_probs_b) {
+                pl = ggml_add(ctx0, pl, msl->next_probs_b);
+            }
+            ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, pl, n_expert_used)); // [n_expert_used, n_tokens]
+            cb(pred, "ffn_moe_prefetch_ids", il);
+            ids_gemm = ggml_map_custom2(ctx0, ids_cont, pred, llama_moe_stream_remap_pf, 1, msl);
+        } else {
+            ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+        }
         cb(ids_gemm, "ffn_moe_topk_stream", il);
     }
 

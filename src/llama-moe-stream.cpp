@@ -434,6 +434,9 @@ void llama_moe_stream::print_stats() const {
             n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
     LLAMA_LOG_INFO("%s: moe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
             __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
+    if (stats.n_prefetch > 0) {
+        LLAMA_LOG_INFO("%s: moe stream: cross-layer prefetches = %" PRId64 "\n", __func__, stats.n_prefetch);
+    }
     if (stats.n_wave_calls > 0) {
         LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
@@ -445,11 +448,47 @@ void llama_moe_stream::print_stats() const {
 // then rewrite each id to its cache slot. this only relabels ids, so the same experts are computed
 // in the same order; the result matches a non-streamed run (bit-exact when both paths use the same
 // kernels, as on CUDA; a CPU build that repacks the non-streamed weights can differ in the last bits).
+static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pf, void * userdata);
+
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
     GGML_UNUSED(nth);
-    if (ith != 0) {
-        return;
+    if (ith == 0) {
+        llama_moe_stream_remap_impl(dst, a, nullptr, userdata);
     }
+}
+
+void llama_moe_stream_remap_pf(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith == 0) {
+        llama_moe_stream_remap_impl(dst, a, b, userdata);
+    }
+}
+
+void llama_moe_stream::prefetch_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
+    sl.pf_keep.assign(sl.n_slots, 0);
+    for (int64_t i = 0; i < n; i++) {
+        const int32_t e = ids[i];
+        if (e < 0 || (uint32_t) e >= sl.n_expert) {
+            continue;
+        }
+        const auto it = sl.expert_slot.find(e);
+        if (it != sl.expert_slot.end()) {
+            sl.pf_keep[it->second] = 1; // resident or loading: keep it over the other predictions
+            continue;
+        }
+        const int32_t v = pick_victim_locked(sl, sl.pf_keep.data());
+        if (v < 0) {
+            return; // every evictable slot is busy loading; the demand path will catch up
+        }
+        reserve_slot_locked(sl, e, v);
+        q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
+        cv_work.notify_one();
+        sl.pf_keep[v] = 1;
+        stats.n_prefetch++;
+    }
+}
+
+static void llama_moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pf, void * userdata) {
 
     auto * sl  = (llama_moe_stream_layer *) userdata;
     auto * mgr = sl->mgr;
@@ -541,6 +580,11 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
             sl->keep[v] = 1;
             sl->demand_slots.push_back(v);
         }
+    }
+
+    if (pf != nullptr && sl->next != nullptr) {
+        GGML_ASSERT(pf->type == GGML_TYPE_I32 && ggml_is_contiguous(pf));
+        mgr->prefetch_locked(*sl->next, (const int32_t *) pf->data, ggml_nelements(pf));
     }
 
     if (waited) {

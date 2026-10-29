@@ -94,6 +94,13 @@ struct llama_moe_stream_layer {
 
     std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave op userdata
 
+    // cross-layer prefetch: the next streamed layer and its router; during decode this layer's
+    // MoE input is scored with that router and the predicted experts start loading right away
+    llama_moe_stream_layer * next          = nullptr;
+    ggml_tensor *            next_gate_inp = nullptr; // {n_embd, n_expert}
+    ggml_tensor *            next_probs_b  = nullptr; // {n_expert} or null
+    std::vector<uint8_t>     pf_keep;                 // [n_slots] scratch for prefetch_locked
+
     // stable userdata for wave w (grows lazily); called at graph build time only
     llama_moe_stream_wave * wave_userdata(int32_t wave, uint32_t capacity);
 
@@ -174,6 +181,7 @@ struct llama_moe_stream {
         int64_t n_wave_calls     = 0; // wave-ids invocations (>= n_calls under multi-pass prefill)
         int64_t n_waves_run      = 0; // non-empty waves
         int64_t n_preload_issued = 0; // next-wave loads started during a wave's compute
+        int64_t n_prefetch       = 0; // cross-layer predicted loads started
         int64_t n_preload_ready  = 0; // wave experts already resident from the previous preload
         int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
     } stats;
@@ -183,6 +191,8 @@ struct llama_moe_stream {
     void worker_loop();
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+    // start (no wait) loads of the predicted experts ids[0..n) of layer sl
+    void prefetch_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n);
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
@@ -192,6 +202,8 @@ struct llama_moe_stream {
 
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+// same, plus b = predicted expert ids of the next streamed layer, prefetched without waiting
+void llama_moe_stream_remap_pf(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids
