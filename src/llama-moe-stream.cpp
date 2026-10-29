@@ -278,9 +278,19 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
             moe_aligned_free(probe);
         }
         if (!ok) {
-            LLAMA_LOG_WARN("%s: O_DIRECT not usable, falling back to buffered streaming reads\n", __func__);
             use_direct_io = false;
             open_all(false);
+#ifdef __APPLE__
+            // macOS has no O_DIRECT; F_NOCACHE on the fd keeps expert reads out of the page cache
+            // (no alignment rules), so the cache slots are the only copy held in memory
+            bool nocache = true;
+            for (auto & f : files) {
+                nocache = fcntl(f->file_id(), F_NOCACHE, 1) == 0 && nocache;
+            }
+            LLAMA_LOG_INFO("%s: MoE expert streaming reads use F_NOCACHE%s\n", __func__, nocache ? "" : " (failed on some files)");
+#else
+            LLAMA_LOG_WARN("%s: O_DIRECT not usable, falling back to buffered streaming reads\n", __func__);
+#endif
         }
     }
 
